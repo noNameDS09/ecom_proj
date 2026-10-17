@@ -12,28 +12,23 @@ no card is ever charged twice.
 
 ## Architecture
 
-```
-                      ┌──────────────────┐
-          REST        │   user-service   │  :8002   accounts, JWT, roles
-     ┌───────────────▶└──────────────────┘
-     │                ┌──────────────────┐
-     │      REST      │ product-service  │  :8001   catalogue, stock,
-┌────┴────┐──────────▶└────────▲─────────┘          reservation ledger
-│frontend │                   │ internal REST
-└────┬────┘                   │ (X-Internal-Token)
-     │ REST         ┌─────────┴────────┐
-     └─────────────▶│  order-service   │  :8003   orders, saga orchestrator
-                    └───┬──────────▲───┘
-                        │          │
-             order.created     payment.events
-                        │          │
-                    ┌───▼──────────┴───┐
-                    │  Kafka (KRaft)   │
-                    └───▲──────────┬───┘
-                        │          │
-                    ┌───┴──────────▼───┐
-                    │ payment-service  │  :8004   charges via simulated PSP
-                    └──────────────────┘
+```mermaid
+flowchart LR
+    FE["frontend :3000<br/>React + Vite SPA"]
+    US["user-service :8002<br/>accounts, JWT, roles"]
+    PS["product-service :8001<br/>catalogue, stock, reservation ledger"]
+    OS["order-service :8003<br/>orders, saga orchestrator"]
+    PAY["payment-service :8004<br/>charges via simulated PSP"]
+    K["Kafka (KRaft)"]
+
+    FE -->|/api/auth, /api/users| US
+    FE -->|/api/products| PS
+    FE -->|/api/orders| OS
+    OS -->|internal REST, X-Internal-Token| PS
+    OS -->|order.created| K
+    K -->|payment.events| OS
+    K -->|order.created| PAY
+    PAY -->|payment.events| K
 ```
 
 | Service           | Port | Database     | Owns                                                        |
@@ -141,18 +136,29 @@ transition, so mixing both paths is safe.
 
 ## The order saga
 
-```
-POST /orders
-  │  price the basket (product-service lookup)
-  │  reserve stock (product-service, idempotent by order id)
-  ▼
-tx: insert order (pending) + insert order.created into outbox     ──── Kafka ────▶ payment-service
-  │                                                                                   │ charge
-  │◀────────────────────── payment.events ◀───────────────── outbox ◀─────────────────┘
-  ▼
-apply_payment_result (idempotent, claimed per event id)
-  ├─ succeeded → commit reservation (stock decreases) → order paid → fulfils later
-  └─ failed    → release reservation (stock restored) → order payment_failed → cancellable
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant O as order-service
+    participant P as product-service
+    participant K as Kafka
+    participant Pay as payment-service
+
+    C->>O: POST /orders with Idempotency-Key
+    O->>P: price basket, reserve stock (idempotent by order id)
+    Note over O: one transaction: insert order (pending) + order.created into outbox
+    O->>K: order.created (outbox relay)
+    K->>Pay: order.created
+    Pay->>Pay: charge via the simulated PSP
+    Pay->>K: payment.events (succeeded or failed)
+    K->>O: payment.events
+    Note over O: apply_payment_result (idempotent, claimed per event id)
+    alt succeeded
+        O->>P: commit reservation (stock decreases) → order paid
+    else failed
+        O->>P: release reservation (stock restored) → order payment_failed, cancellable
+    end
 ```
 
 - **Order created in one transaction with its event**: the outbox row and the
@@ -179,11 +185,16 @@ apply_payment_result (idempotent, claimed per event id)
 
 ## Order lifecycle
 
-```
-pending ──pay──▶ paid ──▶ fulfilled
-   │   │
-   │   └──payment declines──▶ payment_failed ──cancel──▶ cancelled
-   └──cancel──▶ cancelled
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> paid: pay
+    pending --> payment_failed: payment declines
+    pending --> cancelled: cancel
+    paid --> fulfilled: fulfil (admin)
+    payment_failed --> cancelled: cancel
+    fulfilled --> [*]
+    cancelled --> [*]
 ```
 
 Cancelling a `pending`/`payment_failed` order releases its reservation;
