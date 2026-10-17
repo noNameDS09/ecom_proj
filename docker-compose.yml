@@ -1,0 +1,203 @@
+# Local end-to-end stack: Postgres + Kafka (KRaft) + the four services + the
+# storefront.
+#
+#   docker compose up --build
+#
+# The storefront is served at http://localhost:3000 (nginx serves the built SPA
+# and reverse-proxies /api/* to the services). Service ports are also exposed on
+# the host (8001-8004), Kafka is reachable from the host on localhost:19092 (so
+# `TEST_KAFKA_BOOTSTRAP=localhost:19092 pytest` can drive the event pipeline),
+# and Postgres is published on localhost:5433 — 5432 is commonly taken by a
+# system Postgres, so override with POSTGRES_HOST_PORT if you prefer it.
+name: ecommerce
+
+x-app-env: &app-env
+  ENVIRONMENT: local
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO
+  JWT_SECRET: compose-dev-secret-change-me-0123456789abcdef
+  INTERNAL_SERVICE_TOKEN: dev-internal-token
+  RUN_MIGRATIONS: "true"
+  METRICS_ENABLED: "true"
+  ACCESS_LOG_ENABLED: "true"
+  DB_CONNECT_ATTEMPTS: "30"
+  DB_CONNECT_RETRY_DELAY_SECONDS: "1"
+
+x-app-build: &app-build
+  context: .
+  dockerfile: docker/Dockerfile
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: postgres
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "19092:19092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  user-service:
+    build:
+      <<: *app-build
+      args:
+        SERVICE: user-service
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/user_db
+      SERVICE_MODULE: user_service.main:app
+      PORT: "8002"
+      KAFKA_ENABLED: "false"
+      BOOTSTRAP_ADMIN_EMAIL: admin@example.com
+      BOOTSTRAP_ADMIN_PASSWORD: admin-password-1
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/ready', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  product-service:
+    build:
+      <<: *app-build
+      args:
+        SERVICE: product-service
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/product_db
+      SERVICE_MODULE: product_service.main:app
+      PORT: "8001"
+      KAFKA_ENABLED: "false"
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/ready', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  payment-service:
+    build:
+      <<: *app-build
+      args:
+        SERVICE: payment-service
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/payment_db
+      SERVICE_MODULE: payment_service.main:app
+      PORT: "8004"
+      KAFKA_ENABLED: "true"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    ports:
+      - "8004:8004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/ready', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  order-service:
+    build:
+      <<: *app-build
+      args:
+        SERVICE: order-service
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/order_db
+      SERVICE_MODULE: order_service.main:app
+      PORT: "8003"
+      KAFKA_ENABLED: "true"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PRODUCT_SERVICE_URL: http://product-service:8001
+      PAYMENT_SERVICE_URL: http://payment-service:8004
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      product-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/ready', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      product-service:
+        condition: service_healthy
+      user-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  postgres-data:
+  kafka-data:
